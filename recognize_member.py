@@ -4,6 +4,7 @@ import pickle
 import os
 # pyrefly: ignore [missing-import]
 import numpy as np
+import subprocess
 
 def load_camera_source(config_path="camera_config.txt"):
     # Default source
@@ -38,7 +39,7 @@ def load_camera_source(config_path="camera_config.txt"):
     opt = input("Option (1-3) [default: 1]: ").strip()
     if opt == "2":
         url = input("Enter Phone IP URL (e.g., http://192.168.1.50:8080/video): ").strip()
-        if not url.startswith("http"):
+        if "://" not in url:
             url = "http://" + url
         source = url
     elif opt == "3":
@@ -97,6 +98,51 @@ try:
     has_yolo = True
 except ImportError:
     has_yolo = False
+
+# Initialize FER+ Emotion Model (Advanced 1,000,000+ data annotations)
+try:
+    emotion_model = ort.InferenceSession("emotion-ferplus-8.onnx", providers=['CUDAExecutionProvider', 'DirectMLExecutionProvider', 'CPUExecutionProvider'])
+    emotion_labels = ["neutral", "happiness", "surprise", "sadness", "anger", "disgust", "fear", "contempt"]
+    has_emotion = True
+    print("[INFO] Advanced FER+ Emotion AI Loaded.")
+except Exception as e:
+    print(f"[ERROR] Could not load FER+ model: {e}")
+    has_emotion = False
+
+# Try to load Custom Emotion Model (PyTorch ResNet-18)
+try:
+    import torch
+    from torchvision import models, transforms
+    checkpoint = torch.load("custom_emotion_model.pth", map_location=torch.device('cpu'), weights_only=False)
+    custom_classes = checkpoint['classes']
+    
+    import torch.nn as nn
+    custom_emotion_model = models.resnet18(weights=None)
+    num_ftrs = custom_emotion_model.fc.in_features
+    custom_emotion_model.fc = nn.Linear(num_ftrs, len(custom_classes))
+    custom_emotion_model.load_state_dict(checkpoint['state_dict'])
+    custom_emotion_model.eval()
+    
+    from PIL import Image
+    custom_emotion_transforms = transforms.Compose([
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+    ])
+    has_custom_emotion = True
+    print(f"[INFO] Custom PyTorch Emotion AI Loaded with {len(custom_classes)} custom classes!")
+except Exception as e:
+    has_custom_emotion = False
+    print(f"[INFO] Custom PyTorch model not found or error loading: {e}. Using FER+ ONNX fallback.")
+
+# Initialize Body Language Analyzer
+try:
+    from body_language import BodyLanguageAnalyzer
+    body_analyzer = BodyLanguageAnalyzer()
+    has_body_language = True
+except ImportError:
+    print("[ERROR] Body language tracking unavailable. Ensure mediapipe is installed.")
+    has_body_language = False
 
 # Load database and auto-normalize embeddings
 if os.path.exists("embeddings.pkl") and os.path.getsize("embeddings.pkl") > 0:
@@ -266,6 +312,32 @@ def worker():
                     h_mouth = np.linalg.norm(pt52 - pt61)
                     v_mouth = np.linalg.norm(pt71 - pt66)
                     mar = v_mouth / (h_mouth + 1e-6)
+                    
+                    smr = 0.0
+                    brow_elev = 0.0
+                    brow_asym = 0.0
+                    brow_sqz = 0.0
+                    frown_ratio = 0.0
+                    inner_brow_raised = 0.0
+                    
+                    if h_left > 0 and h_right > 0:
+                        eye_dist = np.linalg.norm(lms[39] - lms[89])
+                        smr = h_mouth / (eye_dist + 1e-6)
+                        
+                        leye_c = (lms[35] + lms[39]) / 2.0
+                        reye_c = (lms[89] + lms[93]) / 2.0
+                        
+                        l_brow_h = np.mean([np.linalg.norm(lms[i] - leye_c) for i in [43, 44, 45]])
+                        r_brow_h = np.mean([np.linalg.norm(lms[i] - reye_c) for i in [97, 98, 99]])
+                        
+                        brow_elev = ((l_brow_h / h_left) + (r_brow_h / h_right)) / 2.0
+                        brow_asym = abs((l_brow_h / h_left) - (r_brow_h / h_right))
+                        brow_sqz = np.linalg.norm(lms[43] - lms[97]) / (eye_dist + 1e-6)
+                        
+                        frown_val = (lms[52][1] + lms[61][1]) / 2.0 - (lms[71][1] + lms[66][1]) / 2.0
+                        frown_ratio = frown_val / (h_mouth + 1e-6)
+                        brow_tilt = ((lms[47][1] - lms[43][1]) + (lms[101][1] - lms[97][1])) / 2.0
+                        inner_brow_raised = brow_tilt / (eye_dist + 1e-6)
                 
                 emb = emb / emb_norm if emb_norm > 0 else emb
                 
@@ -295,6 +367,74 @@ def worker():
                 if hasattr(face, 'pose') and face.pose is not None:
                     pose = face.pose
                 
+                # Emotion recognition
+                emotion = "neutral"
+                if has_emotion:
+                    try:
+                        x1_u, y1_u, x2_u, y2_u = face.bbox
+                        w = x2_u - x1_u
+                        h = y2_u - y1_u
+                        
+                        # Expand bbox by 20% to capture full facial context (eyebrows/chin)
+                        pad_w = w * 0.2
+                        pad_h = h * 0.2
+                        
+                        c_x1 = max(0, int(x1_u - pad_w))
+                        c_y1 = max(0, int(y1_u - pad_h))
+                        c_x2 = min(inference_frame.shape[1], int(x2_u + pad_w))
+                        c_y2 = min(inference_frame.shape[0], int(y2_u + pad_h))
+                        
+                        if c_x2 > c_x1 and c_y2 > c_y1:
+                            face_crop = inference_frame[c_y1:c_y2, c_x1:c_x2]
+                            
+                            if has_custom_emotion:
+                                # Custom PyTorch Model Inference
+                                try:
+                                    face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
+                                    pil_img = Image.fromarray(face_rgb)
+                                    input_tensor = custom_emotion_transforms(pil_img).unsqueeze(0)
+                                    
+                                    with torch.no_grad():
+                                        outputs = custom_emotion_model(input_tensor)
+                                        _, preds = torch.max(outputs, 1)
+                                        emotion_idx = preds.item()
+                                        emotion = custom_classes[emotion_idx].lower()
+                                except Exception as e:
+                                    pass
+                            else:
+                                # FER+ expects Grayscale 64x64
+                                face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
+                                face_resized = cv2.resize(face_gray, (64, 64))
+                                
+                                # Normalize
+                                img_data = np.array(face_resized, dtype=np.float32)
+                                img_data = np.expand_dims(img_data, axis=0) # [64, 64] -> [1, 64, 64]
+                                img_data = np.expand_dims(img_data, axis=0) # [1, 64, 64] -> [1, 1, 64, 64]
+                                
+                                # Run ONNX inference
+                                input_name = emotion_model.get_inputs()[0].name
+                                logits = emotion_model.run(None, {input_name: img_data})[0]
+                                
+                                # Get softmax probabilities
+                                max_prob = np.max(logits[0])
+                                exp_logits = np.exp(logits[0] - max_prob)
+                                probs = exp_logits / np.sum(exp_logits)
+                                
+                                # Get dominant emotion
+                                emotion_idx = np.argmax(probs)
+                                emotion = emotion_labels[emotion_idx]
+                            
+                    except Exception as e:
+                        pass
+                
+                # Action/Body Language Analysis
+                action_emotion = None
+                if has_body_language:
+                    try:
+                        action_emotion, _ = body_analyzer.analyze(inference_frame)
+                    except Exception as e:
+                        pass
+                
                 results.append({
                     "bbox": [x1, y1, x2, y2],
                     "det_score": face.det_score,
@@ -303,8 +443,16 @@ def worker():
                     "distance": best_distance,
                     "ear": ear,
                     "mar": mar,
+                    "smr": smr,
+                    "brow_elev": brow_elev,
+                    "brow_asym": brow_asym,
+                    "brow_sqz": brow_sqz,
+                    "frown_ratio": frown_ratio,
+                    "inner_brow_raised": inner_brow_raised,
                     "pose": pose,
-                    "kps": face.kps
+                    "kps": face.kps,
+                    "emotion": emotion,
+                    "action_emotion": action_emotion
                 })
             
             with results_lock:
@@ -321,7 +469,7 @@ t.start()
 cam = CameraStream(CAMERA_SOURCE)
 
 # Cyberpunk HUD UI box drawing helper
-def draw_cyber_box(frame, bbox, name, distance=None, liveness_verified=False, challenge="blink", locked=False, ear=1.0, mar=0.0, pose=[0, 0, 0], kps=None, objects=[]):
+def draw_cyber_box(frame, bbox, name, distance=None, liveness_verified=False, challenge="blink", locked=False, ear=1.0, mar=0.0, pose=[0, 0, 0], kps=None, objects=[], emotion="neutral", emotion_msg=""):
     x1, y1, x2, y2 = bbox
     w_box = x2 - x1
     h_box = y2 - y1
@@ -447,9 +595,9 @@ def draw_cyber_box(frame, bbox, name, distance=None, liveness_verified=False, ch
                     match_pct = int(80 + (0.9 - distance) / 0.1 * 10)
                 else:
                     match_pct = 0
-                label = f"{status_tag} // {name.upper()} // {match_pct}%"
+                label = f"{status_tag} // {name.upper()} // {emotion.upper()} // {match_pct}%"
             else:
-                label = f"{status_tag} // {name.upper()}"
+                label = f"{status_tag} // {name.upper()} // {emotion.upper()}"
         else:
             # Show instructions for liveness challenge and live telemetry
             label = f"{status_tag} // BLINK EYES TO VERIFY [EAR: {ear:.2f}]"
@@ -492,9 +640,235 @@ def draw_cyber_box(frame, bbox, name, distance=None, liveness_verified=False, ch
     cx, cy = x1 + w_box // 2, y1 + h_box // 2
     cv2.circle(frame, (cx, cy), 2, color, -1)
 
+    # 7. Emotional Support HUD
+    if name != "Unknown" and liveness_verified and emotion_msg:
+        (sw, sh), _ = cv2.getTextSize(emotion_msg, cv2.FONT_HERSHEY_SIMPLEX, 0.55, 2)
+        support_y = y1 - 35 if y1 > 60 else y2 + 50
+        support_x = x1 + (w_box - sw) // 2
+        
+        cv2.rectangle(frame, (support_x - 5, support_y - sh - 5), (support_x + sw + 5, support_y + 5), (0, 0, 0), -1)
+        box_color = (0, 150, 255) if emotion in ["sadness", "anger", "fear", "disgust", "frustrated", "exhausted", "confused", "bored"] else (255, 150, 0)
+        text_color = (0, 255, 255) if emotion in ["sadness", "anger", "fear", "disgust", "frustrated", "exhausted", "confused", "bored"] else (255, 255, 0)
+        cv2.rectangle(frame, (support_x - 5, support_y - sh - 5), (support_x + sw + 5, support_y + 5), box_color, 2, lineType=cv2.LINE_AA)
+        cv2.putText(frame, emotion_msg, (support_x, support_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 2, lineType=cv2.LINE_AA)
+
+import random
+
+def get_emotion_message(emotion, name):
+    nm = name.upper()
+    messages = {
+        "neutral": [
+            f"HEY {nm}, YOU LOOK CALM AND FOCUSED.",
+            f"JUST CHILLING, ARE WE, {nm}?",
+            f"LOOKING VERY NEUTRAL TODAY, {nm}."
+        ],
+        "happiness": [
+            f"LOOKING GOOD, {nm}! LOVE THE SMILE!",
+            f"GLAD TO SEE YOU SO HAPPY, {nm}!",
+            f"THAT SMILE LOOKS GREAT ON YOU, {nm}!"
+        ],
+        "surprise": [
+            f"WOW! WHAT SURPRISED YOU, {nm}?",
+            f"DID I STARTLE YOU, {nm}?",
+            f"YOU LOOK SHOCKED, {nm}!"
+        ],
+        "sadness": [
+            f"HEY {nm}, YOU LOOK A BIT DOWN. CHEER UP! YOU'VE GOT THIS!",
+            f"DON'T BE SAD, {nm}. THINGS WILL GET BETTER!",
+            f"I'M HERE FOR YOU, {nm}. KEEP YOUR HEAD UP!"
+        ],
+        "anger": [
+            f"WHOA {nm}, TAKE A DEEP BREATH! CHILL OUT!",
+            f"YOU LOOK FURIOUS, {nm}. RELAX!",
+            f"EASY THERE, {nm}. NO NEED TO BE ANGRY!"
+        ],
+        "disgust": [
+            f"YUCK! SAW SOMETHING GROSS, {nm}?",
+            f"YOU LOOK DISGUSTED, {nm}.",
+            f"NOT A FAN OF THAT, HUH {nm}?"
+        ],
+        "fear": [
+            f"DON'T PANIC, {nm}! EVERYTHING IS FINE!",
+            f"YOU LOOK TERRIFIED, {nm}! BREATHE!",
+            f"IT'S OKAY, {nm}. THERE'S NOTHING TO FEAR."
+        ],
+        "contempt": [
+            f"WHY THE CONTEMPT, {nm}?",
+            f"YOU LOOK LIKE YOU'RE JUDGING ME, {nm}!",
+            f"THAT'S A VERY SCORNFUL LOOK, {nm}."
+        ],
+        "exhausted": [
+            f"YOU LOOK EXHAUSTED, {nm}. GET SOME SLEEP!",
+            f"LONG DAY, {nm}? YOU LOOK TIRED.",
+            f"COFFEE TIME, {nm}! YOU'RE FALLING ASLEEP!"
+        ],
+        "shocked": [
+            f"JAW-DROPPING, ISN'T IT, {nm}?",
+            f"I KNOW, CRAZY RIGHT, {nm}?",
+            f"YOU LOOK COMPLETELY STUNNED, {nm}!"
+        ],
+        "suspicious": [
+            f"WHY THE SUSPICIOUS LOOK, {nm}?",
+            f"I PROMISE I'M NOT HIDING ANYTHING, {nm}!",
+            f"YOU DON'T TRUST ME, DO YOU, {nm}?"
+        ],
+        "confused": [
+            f"ARE YOU CONFUSED, {nm}?",
+            f"LET ME EXPLAIN IT AGAIN, {nm}.",
+            f"YOU LOOK LIKE YOU HAVE A QUESTION, {nm}."
+        ],
+        "frustrated": [
+            f"DON'T LET IT FRUSTRATE YOU, {nm}!",
+            f"TAKE A BREAK, {nm}. YOU LOOK FRUSTRATED.",
+            f"DEEP BREATHS, {nm}. FRUSTRATION WON'T HELP!"
+        ],
+        "euphoric": [
+            f"YOU ARE GLOWING, {nm}! SO HAPPY!",
+            f"ABSOLUTELY BEAMING TODAY, {nm}!",
+            f"LOVE THE ENERGY, {nm}!"
+        ],
+        "bored": [
+            f"ZONING OUT ALREADY, {nm}?",
+            f"AM I BORING YOU, {nm}?",
+            f"WAKE UP, {nm}! PAY ATTENTION!"
+        ],
+        "flirty": [
+            f"WINKING AT ME, {nm}?",
+            f"OH, YOU'RE FLIRTING NOW, {nm}?",
+            f"I SAW THAT WINK, {nm}!"
+        ],
+        "yawning": [
+            f"ROUGH NIGHT, {nm}? YOU'RE YAWNING!",
+            f"AM I THAT BORING THAT YOU'RE YAWNING, {nm}?",
+            f"GET SOME REST, {nm}. BIG YAWN!"
+        ],
+        "smirking": [
+            f"WHAT'S WITH THAT SMIRK, {nm}?",
+            f"YOU THINK YOU'RE CLEVER, {nm}?",
+            f"THAT'S A SNEAKY SMIRK, {nm}."
+        ],
+        "admiration": [
+            f"YOU LOOK LIKE YOU'RE ADMIRING SOMETHING, {nm}.",
+            f"I SENSE DEEP ADMIRATION FROM YOU, {nm}.",
+            f"WHAT HAS CAUGHT YOUR ADMIRATION, {nm}?"
+        ],
+        "adoration": [
+            f"YOU LOOK FULL OF ADORATION, {nm}.",
+            f"THAT'S A VERY ADORING LOOK, {nm}.",
+            f"I CAN FEEL THE ADORATION, {nm}."
+        ],
+        "aesthetic_appreciation": [
+            f"APPRECIATING THE BEAUTY AROUND YOU, {nm}?",
+            f"YOU LOOK LIKE YOU'RE TAKING IN THE AESTHETICS, {nm}.",
+            f"A TRUE APPRECIATION FOR BEAUTY, {nm}."
+        ],
+        "amusement": [
+            f"WHAT'S SO FUNNY, {nm}?",
+            f"YOU LOOK HIGHLY AMUSED, {nm}.",
+            f"CARE TO SHARE THE JOKE, {nm}?"
+        ],
+        "anxiety": [
+            f"TAKE A DEEP BREATH, {nm}. DON'T BE ANXIOUS.",
+            f"YOU LOOK A BIT ANXIOUS, {nm}. RELAX.",
+            f"EVERYTHING WILL BE OKAY, {nm}."
+        ],
+        "awe": [
+            f"YOU LOOK ABSOLUTELY IN AWE, {nm}.",
+            f"SOMETHING AMAZING CAUGHT YOUR EYE, {nm}?",
+            f"A TRUE SENSE OF WONDER, {nm}."
+        ],
+        "awkwardness": [
+            f"THIS IS A BIT AWKWARD, ISN'T IT, {nm}?",
+            f"YOU LOOK FEELING AWKWARD, {nm}.",
+            f"LET'S BREAK THIS AWKWARD SILENCE, {nm}."
+        ],
+        "calmness": [
+            f"YOU LOOK COMPLETELY AT PEACE, {nm}.",
+            f"SUCH A CALM AURA TODAY, {nm}.",
+            f"STAY ZEN, {nm}."
+        ],
+        "craving": [
+            f"WHAT ARE YOU CRAVING, {nm}?",
+            f"YOU LOOK LIKE YOU REALLY WANT SOMETHING, {nm}.",
+            f"A STRONG CRAVING, I SEE."
+        ],
+        "empathetic_pain": [
+            f"I KNOW IT HURTS TO SEE, {nm}.",
+            f"YOU'RE FEELING THEIR PAIN, {nm}.",
+            f"SUCH STRONG EMPATHY FROM YOU, {nm}."
+        ],
+        "entrancement": [
+            f"YOU LOOK COMPLETELY ENTRANCED, {nm}.",
+            f"WHAT HAS YOU SO CAPTIVATED, {nm}?",
+            f"YOU'RE HYPNOTIZED BY IT, {nm}."
+        ],
+        "excitement": [
+            f"YOU LOOK SO EXCITED, {nm}!",
+            f"I CAN FEEL YOUR EXCITEMENT!",
+            f"WHAT'S GOT YOU SO THRILLED, {nm}?"
+        ],
+        "horror": [
+            f"WHAT DID YOU JUST SEE, {nm}?!",
+            f"YOU LOOK ABSOLUTELY HORRIFIED!",
+            f"THAT'S A LOOK OF PURE HORROR, {nm}."
+        ],
+        "interest": [
+            f"YOU LOOK HIGHLY INTRIGUED, {nm}.",
+            f"SOMETHING CAUGHT YOUR INTEREST?",
+            f"YOU'RE PAYING CLOSE ATTENTION, {nm}."
+        ],
+        "joy": [
+            f"YOU'RE RADIATING PURE JOY, {nm}!",
+            f"WHAT A JOYFUL EXPRESSION!",
+            f"IT'S GREAT TO SEE YOU SO JOYFUL, {nm}."
+        ],
+        "nostalgia": [
+            f"THINKING ABOUT THE GOOD OLD DAYS, {nm}?",
+            f"THAT'S A NOSTALGIC LOOK.",
+            f"LOST IN MEMORIES, {nm}?"
+        ],
+        "relief": [
+            f"PHEW! YOU LOOK RELIEVED, {nm}.",
+            f"THAT'S A SIGH OF RELIEF.",
+            f"GLAD THAT'S OVER WITH, RIGHT {nm}?"
+        ],
+        "romance": [
+            f"YOU LOOK FULL OF ROMANCE, {nm}.",
+            f"SOMEBODY IS FEELING ROMANTIC!",
+            f"LOVE IS IN THE AIR, {nm}."
+        ],
+        "satisfaction": [
+            f"YOU LOOK HIGHLY SATISFIED, {nm}.",
+            f"A JOB WELL DONE, RIGHT {nm}?",
+            f"THAT'S THE LOOK OF PURE SATISFACTION."
+        ],
+        "sexual_desire": [
+            f"YOU LOOK LIKE YOU DESIRE SOMEONE, {nm}.",
+            f"SOMEONE IS FEELING PASSIONATE!",
+            f"THAT'S A VERY DESIROUS LOOK, {nm}."
+        ]
+    }
+    
+    if emotion in messages:
+        idx = random.randint(0, len(messages[emotion]) - 1)
+        text = messages[emotion][idx]
+        audio_file = f"audio/{name}_{emotion}_{idx}.mp3"
+        return text, audio_file
+    else:
+        # Fallback for new custom emotions
+        fallback_messages = [
+            f"I SENSE SOME {emotion.upper()} FROM YOU, {nm}.",
+            f"YOU LOOK FULL OF {emotion.upper()}, {nm}.",
+            f"IS THAT {emotion.upper()} I SEE, {nm}?"
+        ]
+        text = random.choice(fallback_messages)
+        audio_file = f"audio/{name}_custom_{emotion}.mp3"
+        return text, audio_file
+
 # Real-time face tracking variables
 tracked_faces = {}
 next_face_id = 0
+tts_process = None
 LERP_FACTOR = 0.35    # Smoother display box interpolation
 
 last_results = None
@@ -619,6 +993,76 @@ while True:
                     tracked_faces[fid]["mar"] = res["mar"]
                     tracked_faces[fid]["pose"] = res["pose"]
                     
+                    prev_emotion = tracked_faces[fid].get("emotion", "neutral")
+                    
+                    # Smooth the EAR for tired detection
+                    current_avg_ear = tracked_faces[fid].get("avg_ear", ear)
+                    avg_ear = current_avg_ear * 0.9 + ear * 0.1
+                    tracked_faces[fid]["avg_ear"] = avg_ear
+                    
+                    # Compute Compound Emotion
+                    base_emotion = res["emotion"]
+                    ear = res["ear"]
+                    ear_left = res.get("ear_left", ear)
+                    ear_right = res.get("ear_right", ear)
+                    mar = res["mar"]
+                    smr = res.get("smr", 0.0)
+                    smirk_asym = res.get("smirk_asym", 0.0)
+                    brow_elev = res.get("brow_elev", 0.0)
+                    brow_asym = res.get("brow_asym", 0.0)
+                    brow_sqz = res.get("brow_sqz", 0.0)
+                    frown_ratio = res.get("frown_ratio", 0.0)
+                    inner_brow_raised = res.get("inner_brow_raised", 0.0)
+                    pitch = res["pose"][0] if hasattr(res["pose"], "__len__") else 0
+                    
+                    compound_emotion = base_emotion
+                    
+                    if abs(ear_left - ear_right) > 0.15 and (ear_left < 0.12 or ear_right < 0.12):
+                        compound_emotion = "flirty"
+                    elif mar > 0.65:
+                        compound_emotion = "yawning"
+                    elif avg_ear < 0.22 and pitch < 0:
+                        compound_emotion = "exhausted"
+                    elif smirk_asym > 0.25 and mar < 0.2:
+                        compound_emotion = "smirking"
+                    elif ear > 0.32 and mar > 0.4 and brow_elev > 1.2:
+                        compound_emotion = "shocked"
+                    elif brow_asym > 0.15:
+                        compound_emotion = "suspicious"
+                    elif brow_sqz < 0.45 and brow_elev < 0.8:
+                        if avg_ear < 0.22 and mar < 0.1:
+                            compound_emotion = "frustrated"
+                        else:
+                            compound_emotion = "confused"
+                    elif (base_emotion == "happiness" or smr > 0.6) and ear > 0.25:
+                        compound_emotion = "euphoric"
+                    elif avg_ear < 0.22 and mar < 0.1 and pitch > 15:
+                        compound_emotion = "bored"
+                        
+                    # Override with body language if a strong action is detected
+                    action_emotion = res.get("action_emotion")
+                    if action_emotion:
+                        compound_emotion = action_emotion
+                        
+                    new_emotion = compound_emotion
+                    tracked_faces[fid]["emotion"] = new_emotion
+                    
+                    if new_emotion != prev_emotion or not tracked_faces[fid].get("emotion_msg"):
+                        msg_text, msg_audio = get_emotion_message(new_emotion, res["name"])
+                        tracked_faces[fid]["emotion_msg"] = msg_text
+                        tracked_faces[fid]["emotion_msg_time"] = current_time
+                        
+                        if msg_text and res["name"] != "Unknown":
+                            if tts_process is not None:
+                                try:
+                                    tts_process.terminate()
+                                except Exception:
+                                    pass
+                            try:
+                                tts_process = subprocess.Popen(["python", "speak_edge.py", msg_text, msg_audio])
+                            except Exception:
+                                pass
+                    
                     tracked_faces[fid]["min_ear"] = min(tracked_faces[fid]["min_ear"], ear)
                     tracked_faces[fid]["max_ear"] = max(tracked_faces[fid]["max_ear"], ear)
                     tracked_faces[fid]["min_mar"] = min(tracked_faces[fid]["min_mar"], mar)
@@ -665,6 +1109,9 @@ while True:
                     "mar": res["mar"],
                     "pose": res["pose"],
                     "kps": res.get("kps", None),
+                    "emotion": res["emotion"],
+                    "emotion_msg": get_emotion_message(res["emotion"], res["name"]) if res["name"] != "Unknown" else "",
+                    "emotion_msg_time": current_time,
                     "liveness_verified": False,
                     "challenge": "blink",
                     "locked": False
@@ -777,7 +1224,9 @@ while True:
             f.get("mar", 0.0),
             f.get("pose", [0, 0, 0]),
             f.get("kps", None),
-            current_objects
+            current_objects,
+            f.get("emotion", "neutral"),
+            f.get("emotion_msg", "")
         )
         
     # Draw detected objects as thin gray boxes for visualization
