@@ -192,6 +192,9 @@ def show_fullscreen(window_name, img):
     else:
         cv2.imshow(window_name, img)
 
+# Video rotation state
+rotation_state = 1  # 0: None, 1: 90 CW, 2: 180, 3: 90 CCW
+
 while True:
     ret, raw_frame = cam.read()
     if not ret or raw_frame is None:
@@ -202,8 +205,12 @@ while True:
         frame = cv2.flip(raw_frame, 1)
     else:
         frame = raw_frame.copy()
-        # Rotate 90 degrees clockwise to match portrait phone orientation
-        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if rotation_state == 1:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_state == 2:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif rotation_state == 3:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     
     # Prevent UI from becoming microscopic on high-res phone cameras
     h, w = frame.shape[:2]
@@ -252,13 +259,25 @@ while True:
         cv2.putText(
             frame,
             "ALIGN FACE & PRESS [SPACE] TO START CAPTURE",
-            (15, h - 20),
+            (15, h - 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.45,
             (255, 255, 255),
             1,
             lineType=cv2.LINE_AA
         )
+        
+        if not isinstance(CAMERA_SOURCE, int):
+            cv2.putText(
+                frame,
+                "PRESS 'R' TO ROTATE CAMERA",
+                (15, h - 15),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.40,
+                (0, 150, 255),
+                1,
+                lineType=cv2.LINE_AA
+            )
 
         # Draw a beautiful circular scanning reticle in the center
         cx, cy = w // 2, h // 2
@@ -280,16 +299,6 @@ while True:
             cv2.rectangle(frame, (x1, y1), (x2, y2), (255, 255, 0), 1, lineType=cv2.LINE_AA)
             draw_cyber_corners(frame, (x1, y1, x2, y2), (255, 255, 0), thickness=2)
             cv2.putText(frame, "READY", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, lineType=cv2.LINE_AA)
-
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord(' '):
-            if len(faces) > 0:
-                state = STATE_CAPTURING
-                print("Acquisition started...")
-            else:
-                print("No face detected! Cannot start acquisition.")
-        elif key == ord('q'):
-            break
 
     elif state == STATE_CAPTURING:
         # Glassmorphic top header
@@ -352,34 +361,43 @@ while True:
 
         # Look for a high-confidence face to record
         recorded_this_frame = False
+        
+        # Find the largest face
+        best_face = None
+        max_area = 0
         for face in faces:
             if face.det_score > 0.75:
                 x1, y1, x2, y2 = face.bbox
-                x1, y1, x2, y2 = int(x1 / scale), int(y1 / scale), int(x2 / scale), int(y2 / scale)
-                w_box = x2 - x1
-                h_box = y2 - y1
-                
-                # Check face size (ensure it's not a tiny background face)
-                if w_box > 80:
-                    emb = face.embedding
-                    norm = np.linalg.norm(emb)
-                    normalized_emb = emb / norm if norm > 0 else emb
-                    samples.append(normalized_emb)
-                    recorded_this_frame = True
+                area = (x2 - x1) * (y2 - y1)
+                if area > max_area and (x2 - x1) / scale > 80:
+                    max_area = area
+                    best_face = face
                     
-                    # Double-border box + corners in Neon Green
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 255, 100), 1, lineType=cv2.LINE_AA)
-                    draw_cyber_corners(frame, (x1, y1, x2, y2), (80, 255, 100), thickness=2)
-                    
-                    # Sweeping scanline inside active capture box
-                    scan_period = 1.0
-                    t_cycle = (time.time() % scan_period) / scan_period
-                    pos = t_cycle * 2 if t_cycle < 0.5 else (1.0 - t_cycle) * 2
-                    scan_y = int(y1 + pos * h_box)
-                    cv2.line(frame, (x1, scan_y), (x2, scan_y), (80, 255, 100), 1, lineType=cv2.LINE_AA)
-                    
-                    cv2.putText(frame, "RECORDING", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 255, 100), 1, lineType=cv2.LINE_AA)
-                    break
+        if best_face is not None:
+            face = best_face
+            x1, y1, x2, y2 = face.bbox
+            x1, y1, x2, y2 = int(x1 / scale), int(y1 / scale), int(x2 / scale), int(y2 / scale)
+            w_box = x2 - x1
+            h_box = y2 - y1
+            
+            emb = face.embedding
+            norm = np.linalg.norm(emb)
+            normalized_emb = emb / norm if norm > 0 else emb
+            samples.append(normalized_emb)
+            recorded_this_frame = True
+            
+            # Double-border box + corners in Neon Green
+            cv2.rectangle(frame, (x1, y1), (x2, y2), (80, 255, 100), 1, lineType=cv2.LINE_AA)
+            draw_cyber_corners(frame, (x1, y1, x2, y2), (80, 255, 100), thickness=2)
+            
+            # Sweeping scanline inside active capture box
+            scan_period = 1.0
+            t_cycle = (time.time() % scan_period) / scan_period
+            pos = t_cycle * 2 if t_cycle < 0.5 else (1.0 - t_cycle) * 2
+            scan_y = int(y1 + pos * h_box)
+            cv2.line(frame, (x1, scan_y), (x2, scan_y), (80, 255, 100), 1, lineType=cv2.LINE_AA)
+            
+            cv2.putText(frame, "RECORDING", (x1, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (80, 255, 100), 1, lineType=cv2.LINE_AA)
 
         if not recorded_this_frame:
             # Alert user if no high-quality face is found
@@ -403,8 +421,7 @@ while True:
                 pickle.dump(database, f)
             print(f"Successfully trained model with {max_samples} samples for '{name}'.")
 
-        key = cv2.waitKey(100) & 0xFF # 100ms spacing between captures
-        if key == ord('q'):
+        if time.time() - success_timer > 2.0:
             break
 
     elif state == STATE_COMPLETED:
@@ -444,16 +461,24 @@ while True:
             lineType=cv2.LINE_AA
         )
 
-        show_fullscreen("Register Member", frame)
-        cv2.waitKey(1)
-
         if time.time() - success_timer > 2.0:
             break
 
     show_fullscreen("Register Member", frame)
-    if state != STATE_CAPTURING: # capture state waitKey is handled with a delay above
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+    
+    # Unified key handling
+    delay = 100 if state == STATE_CAPTURING else 1
+    key = cv2.waitKey(delay) & 0xFF
+    if key == ord('q'):
+        break
+    elif key == ord('r'):
+        rotation_state = (rotation_state + 1) % 4
+    elif key == ord(' ') and state == STATE_ALIGNMENT:
+        if len(faces) > 0:
+            state = STATE_CAPTURING
+            print("Acquisition started...")
+        else:
+            print("No face detected! Cannot start acquisition.")
 
 cam.release()
 cv2.destroyAllWindows()

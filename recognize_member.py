@@ -62,6 +62,7 @@ CAMERA_SOURCE = load_camera_source()
 import onnxruntime as ort
 import threading
 import time
+import random
 
 # Monkey-patch ONNX Runtime to optimize performance on Windows (limit CPU threads to prevent lag)
 original_init = ort.InferenceSession.__init__
@@ -81,10 +82,21 @@ ort.InferenceSession.__init__ = patched_init
 # pyrefly: ignore [missing-import]
 from insightface.app import FaceAnalysis
 
-# Initialize FaceAnalysis optimized for speed (only detection and recognition)
+# Initialize FaceAnalysis optimized for speed (detection, landmark extraction, pose, and recognition)
 # We set det_thresh=0.65 to eliminate false detections on background patterns
-app = FaceAnalysis(name="buffalo_l", allowed_modules=['detection', 'recognition'])
-app.prepare(ctx_id=-1, det_size=(320, 320), det_thresh=0.65)
+app = FaceAnalysis(name="buffalo_l", allowed_modules=['detection', 'landmark_2d_106', 'landmark_3d_68', 'recognition'])
+app.prepare(ctx_id=-1, det_size=(640, 640), det_thresh=0.65)
+
+# Try to load YOLO for Object-Aware Attention Tracking
+try:
+    # pyrefly: ignore [missing-import]
+    from ultralytics import YOLO
+    import logging
+    logging.getLogger("ultralytics").setLevel(logging.ERROR)
+    yolo_model = YOLO("yolov8n.pt", verbose=False)
+    has_yolo = True
+except ImportError:
+    has_yolo = False
 
 # Load database and auto-normalize embeddings
 if os.path.exists("embeddings.pkl") and os.path.getsize("embeddings.pkl") > 0:
@@ -128,6 +140,7 @@ else:
 # Thread-safe variables
 frame_to_process = None
 processed_results = []
+processed_objects = []
 results_lock = threading.Lock()
 frame_lock = threading.Lock()
 running = True
@@ -181,9 +194,9 @@ def worker():
                 frame_to_process = None  # Consume frame
         
         if frame is not None:
-            # Scale frame down for faster model inference (320px width)
+            # Scale frame down for faster model inference (640px width is perfect for crowds)
             h, w = frame.shape[:2]
-            target_width = 320
+            target_width = 640
             scale = target_width / w
             if scale < 1.0:
                 target_height = int(h * scale)
@@ -192,11 +205,68 @@ def worker():
                 scale = 1.0
                 inference_frame = frame
             
+            # 1. Detect objects with YOLOv8 if available
+            detected_objects = []
+            if has_yolo:
+                try:
+                    # Lowered confidence threshold to 0.15 to catch phones held at weird angles
+                    yolo_results = yolo_model(inference_frame, classes=[67, 73], conf=0.15, verbose=False) # 67=cell phone, 73=laptop
+                    if len(yolo_results) > 0:
+                        for box in yolo_results[0].boxes:
+                            cls_id = int(box.cls[0])
+                            obj_name = "phone" if cls_id == 67 else "laptop"
+                            ox1, oy1, ox2, oy2 = box.xyxy[0].cpu().numpy()
+                            detected_objects.append({
+                                "name": obj_name,
+                                "bbox": [int(ox1 / scale), int(oy1 / scale), int(ox2 / scale), int(oy2 / scale)]
+                            })
+                except Exception:
+                    pass
+            
+            # 2. Detect Faces
             faces = app.get(inference_frame)
             results = []
             for face in faces:
+                # Filter out garbage false positives (like chairs), but keep it low enough
+                # to catch actual people sitting far in the background.
+                if face.det_score < 0.45:
+                    continue
+                
                 emb = face.embedding
                 emb_norm = np.linalg.norm(emb)
+                
+                # Calculate Eye Aspect Ratio (EAR) for liveness detection (Blink)
+                ear = 1.0
+                mar = 0.0
+                if hasattr(face, 'landmark_2d_106'):
+                    lms = face.landmark_2d_106
+                    # Left eye indices
+                    pt35, pt39 = lms[35], lms[39] # corners
+                    pt41, pt36 = lms[41], lms[36] # left vertical
+                    pt42, pt37 = lms[42], lms[37] # right vertical
+                    v_left1 = np.linalg.norm(pt41 - pt36)
+                    v_left2 = np.linalg.norm(pt42 - pt37)
+                    h_left = np.linalg.norm(pt35 - pt39)
+                    ear_left = (v_left1 + v_left2) / (2.0 * h_left + 1e-6)
+
+                    # Right eye indices
+                    pt89, pt93 = lms[89], lms[93] # corners
+                    pt95, pt90 = lms[95], lms[90] # left vertical
+                    pt96, pt91 = lms[96], lms[91] # right vertical
+                    v_right1 = np.linalg.norm(pt95 - pt90)
+                    v_right2 = np.linalg.norm(pt96 - pt91)
+                    h_right = np.linalg.norm(pt89 - pt93)
+                    ear_right = (v_right1 + v_right2) / (2.0 * h_right + 1e-6)
+
+                    ear = (ear_left + ear_right) / 2.0
+                    
+                    # Calculate Mouth Aspect Ratio (MAR) for smile/open mouth
+                    pt52, pt61 = lms[52], lms[61]
+                    pt71, pt66 = lms[71], lms[66]
+                    h_mouth = np.linalg.norm(pt52 - pt61)
+                    v_mouth = np.linalg.norm(pt71 - pt66)
+                    mar = v_mouth / (h_mouth + 1e-6)
+                
                 emb = emb / emb_norm if emb_norm > 0 else emb
                 
                 best_name = "Unknown"
@@ -211,25 +281,35 @@ def worker():
                         best_distance = min_dist
                         best_name = name
                 
-                # More strict L2 threshold (1.0) to filter false recognitions
-                if best_distance > 1.0:
+                # Relaxed L2 threshold (1.10) so it successfully identifies registered members
+                # even if they are far in the back, in side-profile, or covering their mouths.
+                if best_distance > 1.10:
                     best_name = "Unknown"
                 
                 # Scale face bounding box coordinates back to full resolution
                 x1, y1, x2, y2 = face.bbox
+                x1, y1, x2, y2 = int(x1 / scale), int(y1 / scale), int(x2 / scale), int(y2 / scale)
+                
+                # Get head pose (pitch, yaw, roll)
+                pose = [0, 0, 0]
+                if hasattr(face, 'pose') and face.pose is not None:
+                    pose = face.pose
+                
                 results.append({
-                    "bbox": [
-                        int(x1 / scale),
-                        int(y1 / scale),
-                        int(x2 / scale),
-                        int(y2 / scale)
-                    ],
+                    "bbox": [x1, y1, x2, y2],
+                    "det_score": face.det_score,
+                    "embedding": emb,
                     "name": best_name,
-                    "distance": best_distance
+                    "distance": best_distance,
+                    "ear": ear,
+                    "mar": mar,
+                    "pose": pose,
+                    "kps": face.kps
                 })
             
             with results_lock:
                 processed_results = results
+                processed_objects = detected_objects
         else:
             time.sleep(0.005)
 
@@ -241,15 +321,19 @@ t.start()
 cam = CameraStream(CAMERA_SOURCE)
 
 # Cyberpunk HUD UI box drawing helper
-def draw_cyber_box(frame, bbox, name, distance=None):
+def draw_cyber_box(frame, bbox, name, distance=None, liveness_verified=False, challenge="blink", locked=False, ear=1.0, mar=0.0, pose=[0, 0, 0], kps=None, objects=[]):
     x1, y1, x2, y2 = bbox
     w_box = x2 - x1
     h_box = y2 - y1
     
-    # BGR colors: Emerald Green for registered, Neon Orange/Red for Unknown
+    # BGR colors based on liveness and recognition status
     if name != "Unknown":
-        color = (80, 255, 100)   # Neon/Emerald Green (BGR)
-        status_tag = "SECURED"
+        if liveness_verified:
+            color = (80, 255, 100)   # Neon/Emerald Green (BGR)
+            status_tag = "SECURED"
+        else:
+            color = (0, 200, 255)    # Cyber Yellow for pending liveness
+            status_tag = "LIVENESS UNVERIFIED"
     else:
         color = (0, 75, 255)     # Cyber Neon Orange/Red (BGR)
         status_tag = "UNAUTHORIZED"
@@ -276,31 +360,99 @@ def draw_cyber_box(frame, bbox, name, distance=None):
     cv2.line(frame, (x2, y2), (x2, y2 - corner_len), color, thickness, lineType=cv2.LINE_AA)
     
     # 3. Sweeping neon scanline
-    scan_period = 2.0  # Seconds
-    t_cycle = (time.time() % scan_period) / scan_period
-    pos = t_cycle * 2 if t_cycle < 0.5 else (1.0 - t_cycle) * 2
-    scan_y = int(y1 + pos * h_box)
+    if not locked:
+        scan_period = 2.0  # Seconds
+        t_cycle = (time.time() % scan_period) / scan_period
+        pos = t_cycle * 2 if t_cycle < 0.5 else (1.0 - t_cycle) * 2
+        scan_y = int(y1 + pos * h_box)
+        
+        # Draw scanline with side ticks
+        cv2.line(frame, (x1, scan_y), (x2, scan_y), color, 1, lineType=cv2.LINE_AA)
+        cv2.line(frame, (x1, scan_y - 2), (x1 + 5, scan_y - 2), color, 1, lineType=cv2.LINE_AA)
+        cv2.line(frame, (x2 - 5, scan_y - 2), (x2, scan_y - 2), color, 1, lineType=cv2.LINE_AA)
+
+    # 6. Draw Behavior / Attention Tracker using 3D Head Pose & Objects
+    pitch, yaw, roll = pose
     
-    # Draw scanline with side ticks
-    cv2.line(frame, (x1 + 3, scan_y), (x2 - 3, scan_y), color, 1, lineType=cv2.LINE_AA)
-    cv2.line(frame, (x1, scan_y - 2), (x1 + 5, scan_y - 2), color, 1, lineType=cv2.LINE_AA)
-    cv2.line(frame, (x2 - 5, scan_y - 2), (x2, scan_y - 2), color, 1, lineType=cv2.LINE_AA)
+    # Calculate mathematically rock-solid YAW using 2D Facial Landmarks
+    # 1. Nose-Offset Ratio: As the head turns, the nose moves horizontally far away from the midpoint between the eyes.
+    is_looking_away = False
+    if kps is not None and len(kps) >= 3:
+        # Euclidean distance between left and right eye
+        eye_dist = ((kps[0][0] - kps[1][0])**2 + (kps[0][1] - kps[1][1])**2)**0.5
+        eye_mid_x = (kps[0][0] + kps[1][0]) / 2.0
+        nose_offset = abs(kps[2][0] - eye_mid_x)
+        
+        # If the nose offset from the center of the eyes exceeds 65% of the eye distance, 
+        # the head is severely turned to the side.
+        if eye_dist > 0 and (nose_offset / eye_dist) > 0.65:
+            is_looking_away = True
+    
+    # Check for YOLO Object Overlaps to override head pose
+    using_phone = False
+    using_laptop = False
+    for obj in objects:
+        ox1, oy1, ox2, oy2 = obj["bbox"]
+        obj_cx = (ox1 + ox2) / 2
+        
+        if obj["name"] == "phone":
+            # If phone is near the face horizontally and vertically
+            if x1 - 100 < obj_cx < x2 + 100 and oy1 < y2 + 350:
+                using_phone = True
+        elif obj["name"] == "laptop":
+            # If laptop is roughly underneath the face
+            if x1 - 150 < obj_cx < x2 + 150 and oy1 > y1:
+                using_laptop = True
+    
+    # Categorize behavior based on angles (Note: pitch > 0 is looking down, pitch < 0 is looking up)
+    behavior_prefix = f"{name.upper()}'S BEHAVIOR" if name != "Unknown" else "BEHAVIOR"
+    
+    if is_looking_away:
+        behavior = f"{behavior_prefix}: DISTRACTED (LOOKING AWAY)"
+        behavior_color = (0, 100, 255) # Orange
+    elif pitch < -25:
+        behavior = f"{behavior_prefix}: LOOKING DOWN AT THEIR BEAN"
+        behavior_color = (255, 150, 0) # Light blue (BGR)
+    elif pitch > 25:
+        behavior = f"{behavior_prefix}: DISTRACTED (LOOKING UP)"
+        behavior_color = (0, 100, 255) # Orange
+    else:
+        behavior = f"{behavior_prefix}: DIRECT ATTENTION"
+        behavior_color = (255, 255, 0) # Cyan
+        
+    # OVERRIDE with Object Logic!
+    if using_phone:
+        behavior = f"{behavior_prefix}: ON PHONE (DISTRACTED)"
+        behavior_color = (0, 0, 255) # Red
+    elif using_laptop:
+        behavior = f"{behavior_prefix}: WORKING ON LAPTOP"
+        behavior_color = (0, 255, 0) # Green
+
+    # Add black background for behavior text to make it perfectly readable
+    (tw, th), _ = cv2.getTextSize(behavior, cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)
+    cv2.rectangle(frame, (x1, y2 + 5), (x1 + tw + 4, y2 + 5 + th + 4), (0, 0, 0), -1)
+    cv2.putText(frame, behavior, (x1 + 2, y2 + 15), cv2.FONT_HERSHEY_SIMPLEX, 0.40, behavior_color, 1, lineType=cv2.LINE_AA)
     
     # 4. Futuristic Text Badge
     if name != "Unknown":
-        if distance is not None:
-            # Distance confidence mapping
-            if distance <= 0.4:
-                match_pct = int(95 + (0.4 - distance) * 12.5)
-            elif distance <= 0.8:
-                match_pct = int(75 + (0.8 - distance) / 0.4 * 20)
-            elif distance <= 1.0:
-                match_pct = int(50 + (1.0 - distance) / 0.2 * 25)
+        if liveness_verified:
+            if distance is not None:
+                # Distance confidence mapping for ArcFace embeddings
+                # L2 distance of 0.7-0.8 represents a highly confident match
+                if distance <= 0.6:
+                    match_pct = int(98 + (0.6 - distance) * 3) # Caps near 99%
+                elif distance <= 0.8:
+                    match_pct = int(90 + (0.8 - distance) / 0.2 * 8)
+                elif distance <= 0.9:
+                    match_pct = int(80 + (0.9 - distance) / 0.1 * 10)
+                else:
+                    match_pct = 0
+                label = f"{status_tag} // {name.upper()} // {match_pct}%"
             else:
-                match_pct = 0
-            label = f"{status_tag} // {name.upper()} // {match_pct}%"
+                label = f"{status_tag} // {name.upper()}"
         else:
-            label = f"{status_tag} // {name.upper()}"
+            # Show instructions for liveness challenge and live telemetry
+            label = f"{status_tag} // BLINK EYES TO VERIFY [EAR: {ear:.2f}]"
     else:
         label = f"{status_tag} // EXCLUDE"
         
@@ -366,6 +518,9 @@ def show_fullscreen(window_name, img):
     else:
         cv2.imshow(window_name, img)
 
+# Video rotation state
+rotation_state = 1  # 0: None, 1: 90 CW, 2: 180, 3: 90 CCW
+
 while True:
     ret, raw_frame = cam.read()
     if not ret or raw_frame is None:
@@ -376,8 +531,12 @@ while True:
         frame = cv2.flip(raw_frame, 1)
     else:
         frame = raw_frame.copy()
-        # Rotate 90 degrees clockwise to match portrait phone orientation
-        frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        if rotation_state == 1:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+        elif rotation_state == 2:
+            frame = cv2.rotate(frame, cv2.ROTATE_180)
+        elif rotation_state == 3:
+            frame = cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
     
     # Prevent UI from becoming microscopic on high-res phone cameras
     h, w = frame.shape[:2]
@@ -396,9 +555,11 @@ while True:
     # Check if there are new processed results from the worker thread
     new_results_available = False
     current_results = []
+    current_objects = []
     with results_lock:
         if processed_results is not last_results:
             current_results = list(processed_results)
+            current_objects = list(processed_objects)
             last_results = processed_results
             new_results_available = True
 
@@ -418,7 +579,7 @@ while True:
             for fid, f in tracked_faces.items():
                 fx1, fy1, fx2, fy2 = f["tracker_bbox"]
                 fcx, fcy = (fx1 + fx2) / 2, (fy1 + fy2) / 2
-                dist = np.sqrt((rcx - fcx)**2 + (rcy - fcy)**2)
+                dist = np.sqrt((rcx - fcx)**2 + (ry1 - fcy)**2)
                 
                 # Dynamic threshold: allow fast movement
                 if dist < max(350, face_size * 2.5):
@@ -436,6 +597,43 @@ while True:
                 tracked_faces[fid]["distance"] = res["distance"]
                 tracked_faces[fid]["last_seen"] = current_time
                 
+                # Update liveness variables only if recognized
+                ear = res["ear"]
+                mar = res["mar"]
+                tracked_faces[fid]["ear"] = ear
+                tracked_faces[fid]["mar"] = mar
+                
+                if res["name"] != "Unknown":
+                    # Lock the tracking if it's a member
+                    tracked_faces[fid]["locked"] = True
+                    
+                    if "min_ear" not in tracked_faces[fid]:
+                        tracked_faces[fid]["min_ear"] = ear
+                        tracked_faces[fid]["max_ear"] = ear
+                        tracked_faces[fid]["min_mar"] = mar
+                        tracked_faces[fid]["max_mar"] = mar
+                        
+                    tracked_faces[fid]["name"] = res["name"]
+                    tracked_faces[fid]["distance"] = res["distance"]
+                    tracked_faces[fid]["ear"] = res["ear"]
+                    tracked_faces[fid]["mar"] = res["mar"]
+                    tracked_faces[fid]["pose"] = res["pose"]
+                    
+                    tracked_faces[fid]["min_ear"] = min(tracked_faces[fid]["min_ear"], ear)
+                    tracked_faces[fid]["max_ear"] = max(tracked_faces[fid]["max_ear"], ear)
+                    tracked_faces[fid]["min_mar"] = min(tracked_faces[fid]["min_mar"], mar)
+                    tracked_faces[fid]["max_mar"] = max(tracked_faces[fid]["max_mar"], mar)
+                    
+                    # Verify liveness based on the assigned challenge
+                    if not tracked_faces[fid].get("liveness_verified", False):
+                        # Hyper-sensitive but secure blink threshold (0.05 diff)
+                        # Adapts to soft blinks but still requires an actual change to prevent static photos.
+                        ear_diff = tracked_faces[fid]["max_ear"] - tracked_faces[fid]["min_ear"]
+                        if ear_diff > 0.05:
+                            tracked_faces[fid]["liveness_verified"] = True
+                else:
+                    tracked_faces[fid]["locked"] = False
+
                 # Crop a new template to track in intermediate frames
                 x1, y1, x2, y2 = res["bbox"]
                 x1_c = max(0, x1)
@@ -462,7 +660,14 @@ while True:
                     "tracker_bbox": list(res["bbox"]),
                     "name": res["name"],
                     "distance": res["distance"],
-                    "last_seen": current_time
+                    "last_seen": current_time,
+                    "ear": res["ear"],
+                    "mar": res["mar"],
+                    "pose": res["pose"],
+                    "kps": res.get("kps", None),
+                    "liveness_verified": False,
+                    "challenge": "blink",
+                    "locked": False
                 }
                 
                 if x2_c > x1_c and y2_c > y1_c:
@@ -474,6 +679,10 @@ while True:
     # 2. Intermediate Frame Template Tracking (Main Thread - 30 FPS)
     # If the AI is busy, we track the face position using template matching
     for fid, f in tracked_faces.items():
+        if f.get("locked", False):
+            # Target is locked; pause intermediate tracking to stabilize the box fully.
+            continue
+            
         if "template" in f and f["template"] is not None:
             tx1, ty1, tx2, ty2 = f["tracker_bbox"]
             tw = tx2 - tx1
@@ -516,8 +725,8 @@ while True:
                 except Exception:
                     pass
 
-    # 3. Clean up stale tracked faces (timeout if not validated by AI for > 0.6s)
-    to_delete = [fid for fid, f in tracked_faces.items() if current_time - f["last_seen"] > 0.6]
+    # 3. Clean up stale tracked faces (timeout if not validated by AI for > 1.5s)
+    to_delete = [fid for fid, f in tracked_faces.items() if current_time - f["last_seen"] > 1.5]
     for fid in to_delete:
         del tracked_faces[fid]
 
@@ -525,8 +734,10 @@ while True:
     for fid, f in tracked_faces.items():
         curr = f["bbox"]
         target = f["tracker_bbox"]
+        # Use stronger smoothing (lower LERP) if the face is locked
+        lerp = 0.15 if f.get("locked", False) else LERP_FACTOR
         for i in range(4):
-            curr[i] = int(curr[i] + LERP_FACTOR * (target[i] - curr[i]))
+            curr[i] = int(curr[i] + lerp * (target[i] - curr[i]))
         f["bbox"] = curr
 
     # 5. Draw Cyber HUD Elements
@@ -554,7 +765,30 @@ while True:
 
     # Draw tracking boxes for active subjects
     for fid, f in tracked_faces.items():
-        draw_cyber_box(frame, f["bbox"], f["name"], f.get("distance"))
+        draw_cyber_box(
+            frame, 
+            f["bbox"], 
+            f["name"], 
+            f.get("distance"),
+            f.get("liveness_verified", False),
+            f.get("challenge", "blink"),
+            f.get("locked", False),
+            f.get("ear", 1.0),
+            f.get("mar", 0.0),
+            f.get("pose", [0, 0, 0]),
+            f.get("kps", None),
+            current_objects
+        )
+        
+    # Draw detected objects as thin gray boxes for visualization
+    for obj in current_objects:
+        ox1, oy1, ox2, oy2 = obj["bbox"]
+        cv2.rectangle(frame, (ox1, oy1), (ox2, oy2), (100, 100, 100), 1)
+        cv2.putText(frame, obj["name"].upper(), (ox1, max(15, oy1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (150, 150, 150), 1)
+    
+    # Draw rotation hint
+    if not isinstance(CAMERA_SOURCE, int):
+        cv2.putText(frame, "PRESS 'R' TO ROTATE CAMERA", (25, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 150, 255), 1, lineType=cv2.LINE_AA)
     
     show_fullscreen("Club Robot", frame)
     
@@ -565,8 +799,11 @@ while True:
         fps_counter = 0
         fps_start_time = time.time()
     
-    if cv2.waitKey(1) & 0xFF == ord("q"):
+    key = cv2.waitKey(1) & 0xFF
+    if key == ord("q"):
         break
+    elif key == ord("r"):
+        rotation_state = (rotation_state + 1) % 4
 
 running = False
 cam.release()
