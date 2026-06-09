@@ -421,9 +421,6 @@ while True:
                 pickle.dump(database, f)
             print(f"Successfully trained model with {max_samples} samples for '{name}'.")
 
-        if time.time() - success_timer > 2.0:
-            break
-
     elif state == STATE_COMPLETED:
         # Full overlay message
         overlay = frame.copy()

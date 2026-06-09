@@ -394,36 +394,51 @@ def worker():
                             face_crop = inference_frame[c_y1:c_y2, c_x1:c_x2]
                             
                             if has_custom_emotion:
-                                # Custom PyTorch Model Inference
+                                # Custom PyTorch Model Inference with Deep Learning TTA (Test-Time Augmentation)
                                 try:
+                                    # pyrefly: ignore [missing-import]
+                                    import torchvision.transforms.functional as F
                                     face_rgb = cv2.cvtColor(face_crop, cv2.COLOR_BGR2RGB)
                                     pil_img = Image.fromarray(face_rgb)
-                                    input_tensor = custom_emotion_transforms(pil_img).unsqueeze(0)
+                                    
+                                    # Apply Deep Learning Transformations for robust accuracy
+                                    t1 = custom_emotion_transforms(pil_img).unsqueeze(0)
+                                    t2 = custom_emotion_transforms(F.hflip(pil_img)).unsqueeze(0)
+                                    t3 = custom_emotion_transforms(F.adjust_brightness(pil_img, 1.2)).unsqueeze(0)
+                                    t4 = custom_emotion_transforms(F.adjust_contrast(pil_img, 1.2)).unsqueeze(0)
+                                    t5 = custom_emotion_transforms(F.adjust_sharpness(pil_img, 2.0)).unsqueeze(0)
+                                    
+                                    input_batch = torch.cat([t1, t2, t3, t4, t5], dim=0)
                                     
                                     with torch.no_grad():
-                                        outputs = custom_emotion_model(input_tensor)
-                                        _, preds = torch.max(outputs, 1)
+                                        outputs = custom_emotion_model(input_batch)
+                                        # Average predictions across all transformations to boost stability
+                                        avg_outputs = torch.mean(outputs, dim=0, keepdim=True)
+                                        _, preds = torch.max(avg_outputs, 1)
                                         emotion_idx = preds.item()
                                         emotion = custom_classes[emotion_idx].lower()
                                 except Exception as e:
                                     pass
                             else:
-                                # FER+ expects Grayscale 64x64
+                                # FER+ expects Grayscale 64x64, using TTA
                                 face_gray = cv2.cvtColor(face_crop, cv2.COLOR_BGR2GRAY)
                                 face_resized = cv2.resize(face_gray, (64, 64))
+                                face_flipped = cv2.flip(face_resized, 1)
                                 
-                                # Normalize
-                                img_data = np.array(face_resized, dtype=np.float32)
-                                img_data = np.expand_dims(img_data, axis=0) # [64, 64] -> [1, 64, 64]
-                                img_data = np.expand_dims(img_data, axis=0) # [1, 64, 64] -> [1, 1, 64, 64]
+                                def run_fer(img):
+                                    img_data = np.array(img, dtype=np.float32)
+                                    img_data = np.expand_dims(img_data, axis=0)
+                                    img_data = np.expand_dims(img_data, axis=0)
+                                    input_name = emotion_model.get_inputs()[0].name
+                                    return emotion_model.run(None, {input_name: img_data})[0][0]
                                 
-                                # Run ONNX inference
-                                input_name = emotion_model.get_inputs()[0].name
-                                logits = emotion_model.run(None, {input_name: img_data})[0]
+                                logits1 = run_fer(face_resized)
+                                logits2 = run_fer(face_flipped)
+                                avg_logits = (logits1 + logits2) / 2.0
                                 
                                 # Get softmax probabilities
-                                max_prob = np.max(logits[0])
-                                exp_logits = np.exp(logits[0] - max_prob)
+                                max_prob = np.max(avg_logits)
+                                exp_logits = np.exp(avg_logits - max_prob)
                                 probs = exp_logits / np.sum(exp_logits)
                                 
                                 # Get dominant emotion
@@ -468,106 +483,117 @@ def worker():
             time.sleep(0.005)
 
 vision_latest_msg = ""
+api_consolidated_emotion = "NEUTRAL"
 
 def vision_worker_thread():
-    global vision_latest_msg, frame_to_process, running, processed_results
+    global vision_latest_msg, api_consolidated_emotion, frame_to_process, running, processed_results
     
-    # Initialize OpenAI client for Nvidia API
+    # Initialize the OpenAI client with NVIDIA's API URL
     client = OpenAI(
       base_url = "https://integrate.api.nvidia.com/v1",
       api_key = os.getenv("NVIDIA_API_KEY", "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")
     )
 
-    last_seen_emotion = None
-    emotion_stable_since = time.time()
-    last_reacted_emotion = None
+    last_api_call_time = 0
 
     while running:
-        time.sleep(0.1)
+        time.sleep(0.5)
         
-        current_emotion = None
+        detected_people = []
         with results_lock:
-            if processed_results and len(processed_results) > 0:
-                current_emotion = processed_results[0].get("emotion", None)
+            if processed_results:
+                detected_people = processed_results.copy()
                 
-        if not current_emotion:
+        if not detected_people:
             continue
             
-        if current_emotion != last_seen_emotion:
-            last_seen_emotion = current_emotion
-            emotion_stable_since = time.time()
+        # Continuously observe and generate messages every 6 seconds 
+        if (time.time() - last_api_call_time) >= 6.0:
+            last_api_call_time = time.time()
             
-        # Add a 3-second delay with detecting to ensure the emotion is stable
-        if (time.time() - emotion_stable_since) >= 3.0:
-            if current_emotion != last_reacted_emotion:
-                # Emotion has changed and stayed stable! Let's react!
-                last_reacted_emotion = current_emotion
-                
-                frame = None
-                with frame_lock:
-                    if frame_to_process is not None:
-                        h, w = frame_to_process.shape[:2]
-                        scale = 512 / w
-                        frame = cv2.resize(frame_to_process, (512, int(h * scale)))
-                        
-                if frame is not None:
-                    try:
-                        _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
-                        base64_image = base64.b64encode(buffer.tobytes()).decode('utf-8')
-                        
-                        context = f"Your previous message to them was: '{vision_latest_msg}'. " if vision_latest_msg else "This is your first message. "
-                        prompt = context + f"The person's emotion just changed to {current_emotion}. Analyze the image. Smoothly and seamlessly acknowledge this change in your conversation (e.g., 'Oh, I see a smile now!'). Format your response exactly like this: Observation: [your internal thought]. Message: \"[your sweet 1-2 sentence message directed at them]\""
-                        
-                        completion = client.chat.completions.create(
-                          model="meta/llama-3.2-11b-vision-instruct",
-                          messages=[
+            frame = None
+            with frame_lock:
+                if frame_to_process is not None:
+                    h, w = frame_to_process.shape[:2]
+                    scale = 512 / w
+                    frame = cv2.resize(frame_to_process, (512, int(h * scale)))
+                    
+            if frame is not None:
+                try:
+                    _, buffer = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                    base64_image = base64.b64encode(buffer.tobytes()).decode('utf-8')
+                    
+                    # Build context to feed the AI about who is registered
+                    registered = [f"{p['name']} (Base Emotion: {p['emotion']})" for p in detected_people if p['name'] != "UNKNOWN"]
+                    unregistered = [f"Unknown Person (Base Emotion: {p['emotion']})" for p in detected_people if p['name'] == "UNKNOWN"]
+                    
+                    people_context = ""
+                    if registered:
+                        people_context += f"Registered members present: {', '.join(registered)}. "
+                    if unregistered:
+                        people_context += f"Unregistered people present: {', '.join(unregistered)}. "
+                    
+                    context = f"Your previous message to them was: '{vision_latest_msg}'. DO NOT repeat it, say something new. " if vision_latest_msg else "This is your first message. "
+                    prompt = context + people_context + "Carefully analyze everyone's facial expressions and body language in the image. Give strong preference and priority to the registered members when continuing the conversation. If a registered member is sad, give them a brief cheering message. If happy, a brief compliment. Keep it natural. Format your response exactly like this: Emotion: [One word summarizing the registered member's true emotion, or the overall vibe if none]. Observation: [your internal thought]. Message: \"[A single, short communicative sentence under 12 words directed at them]\""
+                    
+                    completion = client.chat.completions.create(
+                        model="meta/llama-3.2-90b-vision-instruct",
+                        messages=[
                             {
-                              "role": "user",
-                              "content": [
-                                {"type": "text", "text": prompt},
-                                {
-                                  "type": "image_url",
-                                  "image_url": {
-                                    "url": f"data:image/jpeg;base64,{base64_image}"
-                                  }
-                                }
-                              ]
+                                "role": "user",
+                                "content": [
+                                    {"type": "text", "text": prompt},
+                                    {
+                                        "type": "image_url",
+                                        "image_url": {
+                                            "url": f"data:image/jpeg;base64,{base64_image}"
+                                        }
+                                    }
+                                ]
                             }
-                          ],
-                          temperature=0.7,
-                          top_p=0.90,
-                          max_tokens=80,
-                          stream=False
-                        )
-                        import re
-                        raw_response = completion.choices[0].message.content.strip()
-                        match = re.search(r'"([^"]*)"', raw_response)
+                        ],
+                        temperature=0.7,
+                        top_p=0.90,
+                        max_tokens=80,
+                        stream=False,
+                        timeout=12.0
+                    )
+                    
+                    import re
+                    raw_response = completion.choices[0].message.content.strip()
+                    
+                    emo_match = re.search(r'Emotion[^a-zA-Z]*([a-zA-Z]+)', raw_response, re.IGNORECASE)
+                    if emo_match:
+                        api_consolidated_emotion = emo_match.group(1).strip().upper()
                         
-                        if match:
-                            extracted_msg = match.group(1).strip()
-                        elif "Message:" in raw_response:
-                            extracted_msg = raw_response.split("Message:")[-1].strip()
-                        else:
-                            extracted_msg = raw_response
-                        
-                        vision_latest_msg = extracted_msg.replace('\n', ' ').replace('"', '').replace("'", "")
-                        
-                        # Speak in a background daemon thread so it never blocks or crashes the vision loop
-                        import threading
-                        def play_audio(msg):
-                            try:
-                                subprocess.run(["python", "speak_edge.py", msg], timeout=15)
-                            except Exception as e:
-                                print(f"[TTS Error]: {e}")
-                                
-                        threading.Thread(target=play_audio, args=(vision_latest_msg,), daemon=True).start()
-                        
-                    except Exception as e:
-                        print(f"[Vision API Error]: {repr(e)}")
-                        import traceback
-                        traceback.print_exc()
+                    match = re.search(r'"([^"]*)"', raw_response)
+                    
+                    if match:
+                        extracted_msg = match.group(1).strip()
+                    elif "Message:" in raw_response:
+                        extracted_msg = raw_response.split("Message:")[-1].strip()
+                    else:
+                        extracted_msg = raw_response
+                    
+                    vision_latest_msg = extracted_msg.replace('\n', ' ').replace('"', '').replace("'", "")
+                    
+                    # Speak in a background daemon thread so it never blocks or crashes the vision loop
+                    import threading
+                    def play_audio(msg):
+                        try:
+                            subprocess.run(["python", "speak_edge.py", msg], timeout=15)
+                        except Exception as e:
+                            print(f"[TTS Error]: {e}")
+                            
+                    threading.Thread(target=play_audio, args=(vision_latest_msg,), daemon=True).start()
+                    
+                except Exception as e:
+                    print(f"[Vision API Error]: {repr(e)}")
+                    import traceback
+                    traceback.print_exc()
 
 # Start Vision API worker thread
+# pyrefly: ignore [parse-error]
 v_thread = threading.Thread(target=vision_worker_thread, daemon=True)
 v_thread.start()
 
@@ -1310,6 +1336,12 @@ while True:
 
     # Draw tracking boxes for active subjects
     for fid, f in tracked_faces.items():
+        # Display both the fast local emotion and the slow API emotion in parallel
+        if vision_latest_msg and api_consolidated_emotion:
+            display_emo = f"{f.get('emotion', 'neutral').upper()} -> {api_consolidated_emotion}"
+        else:
+            display_emo = f.get("emotion", "neutral").upper()
+        
         draw_cyber_box(
             frame, 
             f["bbox"], 
@@ -1323,7 +1355,7 @@ while True:
             f.get("pose", [0, 0, 0]),
             f.get("kps", None),
             current_objects,
-            f.get("emotion", "neutral"),
+            display_emo,
             f.get("emotion_msg", "")
         )
         
@@ -1337,30 +1369,25 @@ while True:
     if not isinstance(CAMERA_SOURCE, int):
         cv2.putText(frame, "PRESS 'R' TO ROTATE CAMERA", (25, 116), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 150, 255), 1, lineType=cv2.LINE_AA)
     
-    # Draw Vision API Encouragement Message
+    # Draw Vision API Encouragement Message as a sleek subtitle
     if vision_latest_msg:
-        wrapped_text = textwrap.wrap(vision_latest_msg, width=65)
-        # Use a more elegant, thinner font
         font = cv2.FONT_HERSHEY_DUPLEX
-        font_scale = 0.55
+        font_scale = 0.65
         thickness = 1
         
-        # Calculate dynamic height based on text lines
-        line_spacing = 22
-        box_height = len(wrapped_text) * line_spacing + 40
-        start_y = frame.shape[0] - box_height - 15
+        # Measure text size to center it
+        (tw, th), _ = cv2.getTextSize(vision_latest_msg, font, font_scale, thickness)
         
-        # Draw sleek semi-transparent glassmorphic background
-        overlay2 = frame.copy()
-        cv2.rectangle(overlay2, (15, start_y), (frame.shape[1] - 15, frame.shape[0] - 15), (10, 10, 10), -1)
-        cv2.addWeighted(overlay2, 0.65, frame, 0.35, 0, frame)
+        # Position at the bottom center
+        frame_h, frame_w = frame.shape[:2]
+        cx = (frame_w - tw) // 2
+        if cx < 10: cx = 10 # Prevent going off left edge
+        cy = frame_h - 40
         
-        # Draw a thin, elegant neon border
-        cv2.rectangle(frame, (15, start_y), (frame.shape[1] - 15, frame.shape[0] - 15), (255, 180, 50), 1, lineType=cv2.LINE_AA)
-        
-        cv2.putText(frame, "AI OBSERVER", (25, start_y + 22), cv2.FONT_HERSHEY_DUPLEX, 0.45, (255, 200, 50), 1, lineType=cv2.LINE_AA)
-        for i, line in enumerate(wrapped_text):
-            cv2.putText(frame, line, (25, start_y + 48 + (i * line_spacing)), font, font_scale, (255, 255, 255), thickness, lineType=cv2.LINE_AA)
+        # Draw shadow for readability
+        cv2.putText(frame, vision_latest_msg, (cx + 2, cy + 2), font, font_scale, (0, 0, 0), thickness + 1, lineType=cv2.LINE_AA)
+        # Draw main text in yellow
+        cv2.putText(frame, vision_latest_msg, (cx, cy), font, font_scale, (0, 220, 255), thickness, lineType=cv2.LINE_AA)
     
     show_fullscreen("Club Robot", frame)
     
