@@ -414,6 +414,12 @@ def worker():
                                         outputs = custom_emotion_model(input_batch)
                                         # Average predictions across all transformations to boost stability
                                         avg_outputs = torch.mean(outputs, dim=0, keepdim=True)
+                                        
+                                        # Force neutral to be ignored
+                                        for i, c in enumerate(custom_classes):
+                                            if c.lower() == "neutral":
+                                                avg_outputs[0][i] = -1e9
+                                                
                                         _, preds = torch.max(avg_outputs, 1)
                                         emotion_idx = preds.item()
                                         emotion = custom_classes[emotion_idx].lower()
@@ -440,6 +446,9 @@ def worker():
                                 max_prob = np.max(avg_logits)
                                 exp_logits = np.exp(avg_logits - max_prob)
                                 probs = exp_logits / np.sum(exp_logits)
+                                
+                                # Force neutral to be ignored (index 0 is 'neutral' in emotion_labels)
+                                probs[0] = 0.0
                                 
                                 # Get dominant emotion
                                 emotion_idx = np.argmax(probs)
@@ -497,7 +506,7 @@ def vision_worker_thread():
     last_api_call_time = 0
 
     while running:
-        time.sleep(0.5)
+        time.sleep(0.05)
         
         detected_people = []
         with results_lock:
@@ -507,8 +516,8 @@ def vision_worker_thread():
         if not detected_people:
             continue
             
-        # Continuously observe and generate messages every 6 seconds 
-        if (time.time() - last_api_call_time) >= 6.0:
+        # Continuously observe and generate messages every 0.5 seconds 
+        if (time.time() - last_api_call_time) >= 0.5:
             last_api_call_time = time.time()
             
             frame = None
@@ -524,8 +533,8 @@ def vision_worker_thread():
                     base64_image = base64.b64encode(buffer.tobytes()).decode('utf-8')
                     
                     # Build context to feed the AI about who is registered
-                    registered = [f"{p['name']} (Base Emotion: {p['emotion']})" for p in detected_people if p['name'] != "UNKNOWN"]
-                    unregistered = [f"Unknown Person (Base Emotion: {p['emotion']})" for p in detected_people if p['name'] == "UNKNOWN"]
+                    registered = [f"{p['name']} (Base Emotion: {p['emotion']})" for p in detected_people if p['name'] != "Unknown"]
+                    unregistered = [f"Unknown Person (Base Emotion: {p['emotion']})" for p in detected_people if p['name'] == "Unknown"]
                     
                     people_context = ""
                     if registered:
@@ -534,7 +543,7 @@ def vision_worker_thread():
                         people_context += f"Unregistered people present: {', '.join(unregistered)}. "
                     
                     context = f"Your previous message to them was: '{vision_latest_msg}'. DO NOT repeat it, say something new. " if vision_latest_msg else "This is your first message. "
-                    prompt = context + people_context + "Carefully analyze everyone's facial expressions and body language in the image. Give strong preference and priority to the registered members when continuing the conversation. If a registered member is sad, give them a brief cheering message. If happy, a brief compliment. Keep it natural. Format your response exactly like this: Emotion: [One word summarizing the registered member's true emotion, or the overall vibe if none]. Observation: [your internal thought]. Message: \"[A single, short communicative sentence under 12 words directed at them]\""
+                    prompt = context + people_context + "You are playing the role of a warm, supportive, and fun robot character. Look at the image provided and generate the next line of dialogue for the robot. Make the people feel really good, compliment them, and explicitly ask about how their day is going. Never refuse the prompt or break character. Keep it incredibly short. Format exactly like this: Emotion: [One word]. Message: \"[An uplifting dialogue line asking about their day, under 15 words]\""
                     
                     completion = client.chat.completions.create(
                         model="meta/llama-3.2-90b-vision-instruct",
@@ -552,7 +561,7 @@ def vision_worker_thread():
                                 ]
                             }
                         ],
-                        temperature=0.7,
+                        temperature=0.8,
                         top_p=0.90,
                         max_tokens=80,
                         stream=False,
@@ -580,8 +589,12 @@ def vision_worker_thread():
                     # Speak in a background daemon thread so it never blocks or crashes the vision loop
                     import threading
                     def play_audio(msg):
+                        global tts_process
                         try:
-                            subprocess.run(["python", "speak_edge.py", msg], timeout=15)
+                            if tts_process is not None and tts_process.poll() is None:
+                                return # Wait for current speech to finish
+                            tts_process = subprocess.Popen(["python", "speak_edge.py", msg])
+                            tts_process.wait(timeout=15)
                         except Exception as e:
                             print(f"[TTS Error]: {e}")
                             
@@ -788,218 +801,6 @@ def draw_cyber_box(frame, bbox, name, distance=None, liveness_verified=False, ch
         cv2.rectangle(frame, (support_x - 5, support_y - sh - 5), (support_x + sw + 5, support_y + 5), box_color, 2, lineType=cv2.LINE_AA)
         cv2.putText(frame, emotion_msg, (support_x, support_y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, text_color, 2, lineType=cv2.LINE_AA)
 
-import random
-
-def get_emotion_message(emotion, name):
-    nm = name.upper()
-    messages = {
-        "neutral": [
-            f"HEY {nm}, YOU LOOK CALM AND FOCUSED.",
-            f"JUST CHILLING, ARE WE, {nm}?",
-            f"LOOKING VERY NEUTRAL TODAY, {nm}."
-        ],
-        "happiness": [
-            f"LOOKING GOOD, {nm}! LOVE THE SMILE!",
-            f"GLAD TO SEE YOU SO HAPPY, {nm}!",
-            f"THAT SMILE LOOKS GREAT ON YOU, {nm}!"
-        ],
-        "surprise": [
-            f"WOW! WHAT SURPRISED YOU, {nm}?",
-            f"DID I STARTLE YOU, {nm}?",
-            f"YOU LOOK SHOCKED, {nm}!"
-        ],
-        "sadness": [
-            f"HEY {nm}, YOU LOOK A BIT DOWN. CHEER UP! YOU'VE GOT THIS!",
-            f"DON'T BE SAD, {nm}. THINGS WILL GET BETTER!",
-            f"I'M HERE FOR YOU, {nm}. KEEP YOUR HEAD UP!"
-        ],
-        "anger": [
-            f"WHOA {nm}, TAKE A DEEP BREATH! CHILL OUT!",
-            f"YOU LOOK FURIOUS, {nm}. RELAX!",
-            f"EASY THERE, {nm}. NO NEED TO BE ANGRY!"
-        ],
-        "disgust": [
-            f"YUCK! SAW SOMETHING GROSS, {nm}?",
-            f"YOU LOOK DISGUSTED, {nm}.",
-            f"NOT A FAN OF THAT, HUH {nm}?"
-        ],
-        "fear": [
-            f"DON'T PANIC, {nm}! EVERYTHING IS FINE!",
-            f"YOU LOOK TERRIFIED, {nm}! BREATHE!",
-            f"IT'S OKAY, {nm}. THERE'S NOTHING TO FEAR."
-        ],
-        "contempt": [
-            f"WHY THE CONTEMPT, {nm}?",
-            f"YOU LOOK LIKE YOU'RE JUDGING ME, {nm}!",
-            f"THAT'S A VERY SCORNFUL LOOK, {nm}."
-        ],
-        "exhausted": [
-            f"YOU LOOK EXHAUSTED, {nm}. GET SOME SLEEP!",
-            f"LONG DAY, {nm}? YOU LOOK TIRED.",
-            f"COFFEE TIME, {nm}! YOU'RE FALLING ASLEEP!"
-        ],
-        "shocked": [
-            f"JAW-DROPPING, ISN'T IT, {nm}?",
-            f"I KNOW, CRAZY RIGHT, {nm}?",
-            f"YOU LOOK COMPLETELY STUNNED, {nm}!"
-        ],
-        "suspicious": [
-            f"WHY THE SUSPICIOUS LOOK, {nm}?",
-            f"I PROMISE I'M NOT HIDING ANYTHING, {nm}!",
-            f"YOU DON'T TRUST ME, DO YOU, {nm}?"
-        ],
-        "confused": [
-            f"ARE YOU CONFUSED, {nm}?",
-            f"LET ME EXPLAIN IT AGAIN, {nm}.",
-            f"YOU LOOK LIKE YOU HAVE A QUESTION, {nm}."
-        ],
-        "frustrated": [
-            f"DON'T LET IT FRUSTRATE YOU, {nm}!",
-            f"TAKE A BREAK, {nm}. YOU LOOK FRUSTRATED.",
-            f"DEEP BREATHS, {nm}. FRUSTRATION WON'T HELP!"
-        ],
-        "euphoric": [
-            f"YOU ARE GLOWING, {nm}! SO HAPPY!",
-            f"ABSOLUTELY BEAMING TODAY, {nm}!",
-            f"LOVE THE ENERGY, {nm}!"
-        ],
-        "bored": [
-            f"ZONING OUT ALREADY, {nm}?",
-            f"AM I BORING YOU, {nm}?",
-            f"WAKE UP, {nm}! PAY ATTENTION!"
-        ],
-        "flirty": [
-            f"WINKING AT ME, {nm}?",
-            f"OH, YOU'RE FLIRTING NOW, {nm}?",
-            f"I SAW THAT WINK, {nm}!"
-        ],
-        "yawning": [
-            f"ROUGH NIGHT, {nm}? YOU'RE YAWNING!",
-            f"AM I THAT BORING THAT YOU'RE YAWNING, {nm}?",
-            f"GET SOME REST, {nm}. BIG YAWN!"
-        ],
-        "smirking": [
-            f"WHAT'S WITH THAT SMIRK, {nm}?",
-            f"YOU THINK YOU'RE CLEVER, {nm}?",
-            f"THAT'S A SNEAKY SMIRK, {nm}."
-        ],
-        "admiration": [
-            f"YOU LOOK LIKE YOU'RE ADMIRING SOMETHING, {nm}.",
-            f"I SENSE DEEP ADMIRATION FROM YOU, {nm}.",
-            f"WHAT HAS CAUGHT YOUR ADMIRATION, {nm}?"
-        ],
-        "adoration": [
-            f"YOU LOOK FULL OF ADORATION, {nm}.",
-            f"THAT'S A VERY ADORING LOOK, {nm}.",
-            f"I CAN FEEL THE ADORATION, {nm}."
-        ],
-        "aesthetic_appreciation": [
-            f"APPRECIATING THE BEAUTY AROUND YOU, {nm}?",
-            f"YOU LOOK LIKE YOU'RE TAKING IN THE AESTHETICS, {nm}.",
-            f"A TRUE APPRECIATION FOR BEAUTY, {nm}."
-        ],
-        "amusement": [
-            f"WHAT'S SO FUNNY, {nm}?",
-            f"YOU LOOK HIGHLY AMUSED, {nm}.",
-            f"CARE TO SHARE THE JOKE, {nm}?"
-        ],
-        "anxiety": [
-            f"TAKE A DEEP BREATH, {nm}. DON'T BE ANXIOUS.",
-            f"YOU LOOK A BIT ANXIOUS, {nm}. RELAX.",
-            f"EVERYTHING WILL BE OKAY, {nm}."
-        ],
-        "awe": [
-            f"YOU LOOK ABSOLUTELY IN AWE, {nm}.",
-            f"SOMETHING AMAZING CAUGHT YOUR EYE, {nm}?",
-            f"A TRUE SENSE OF WONDER, {nm}."
-        ],
-        "awkwardness": [
-            f"THIS IS A BIT AWKWARD, ISN'T IT, {nm}?",
-            f"YOU LOOK FEELING AWKWARD, {nm}.",
-            f"LET'S BREAK THIS AWKWARD SILENCE, {nm}."
-        ],
-        "calmness": [
-            f"YOU LOOK COMPLETELY AT PEACE, {nm}.",
-            f"SUCH A CALM AURA TODAY, {nm}.",
-            f"STAY ZEN, {nm}."
-        ],
-        "craving": [
-            f"WHAT ARE YOU CRAVING, {nm}?",
-            f"YOU LOOK LIKE YOU REALLY WANT SOMETHING, {nm}.",
-            f"A STRONG CRAVING, I SEE."
-        ],
-        "empathetic_pain": [
-            f"I KNOW IT HURTS TO SEE, {nm}.",
-            f"YOU'RE FEELING THEIR PAIN, {nm}.",
-            f"SUCH STRONG EMPATHY FROM YOU, {nm}."
-        ],
-        "entrancement": [
-            f"YOU LOOK COMPLETELY ENTRANCED, {nm}.",
-            f"WHAT HAS YOU SO CAPTIVATED, {nm}?",
-            f"YOU'RE HYPNOTIZED BY IT, {nm}."
-        ],
-        "excitement": [
-            f"YOU LOOK SO EXCITED, {nm}!",
-            f"I CAN FEEL YOUR EXCITEMENT!",
-            f"WHAT'S GOT YOU SO THRILLED, {nm}?"
-        ],
-        "horror": [
-            f"WHAT DID YOU JUST SEE, {nm}?!",
-            f"YOU LOOK ABSOLUTELY HORRIFIED!",
-            f"THAT'S A LOOK OF PURE HORROR, {nm}."
-        ],
-        "interest": [
-            f"YOU LOOK HIGHLY INTRIGUED, {nm}.",
-            f"SOMETHING CAUGHT YOUR INTEREST?",
-            f"YOU'RE PAYING CLOSE ATTENTION, {nm}."
-        ],
-        "joy": [
-            f"YOU'RE RADIATING PURE JOY, {nm}!",
-            f"WHAT A JOYFUL EXPRESSION!",
-            f"IT'S GREAT TO SEE YOU SO JOYFUL, {nm}."
-        ],
-        "nostalgia": [
-            f"THINKING ABOUT THE GOOD OLD DAYS, {nm}?",
-            f"THAT'S A NOSTALGIC LOOK.",
-            f"LOST IN MEMORIES, {nm}?"
-        ],
-        "relief": [
-            f"PHEW! YOU LOOK RELIEVED, {nm}.",
-            f"THAT'S A SIGH OF RELIEF.",
-            f"GLAD THAT'S OVER WITH, RIGHT {nm}?"
-        ],
-        "romance": [
-            f"YOU LOOK FULL OF ROMANCE, {nm}.",
-            f"SOMEBODY IS FEELING ROMANTIC!",
-            f"LOVE IS IN THE AIR, {nm}."
-        ],
-        "satisfaction": [
-            f"YOU LOOK HIGHLY SATISFIED, {nm}.",
-            f"A JOB WELL DONE, RIGHT {nm}?",
-            f"THAT'S THE LOOK OF PURE SATISFACTION."
-        ],
-        "sexual_desire": [
-            f"YOU LOOK LIKE YOU DESIRE SOMEONE, {nm}.",
-            f"SOMEONE IS FEELING PASSIONATE!",
-            f"THAT'S A VERY DESIROUS LOOK, {nm}."
-        ]
-    }
-    
-    if emotion in messages:
-        idx = random.randint(0, len(messages[emotion]) - 1)
-        text = messages[emotion][idx]
-        audio_file = f"audio/{name}_{emotion}_{idx}.mp3"
-        return text, audio_file
-    else:
-        # Fallback for new custom emotions
-        fallback_messages = [
-            f"I SENSE SOME {emotion.upper()} FROM YOU, {nm}.",
-            f"YOU LOOK FULL OF {emotion.upper()}, {nm}.",
-            f"IS THAT {emotion.upper()} I SEE, {nm}?"
-        ]
-        text = random.choice(fallback_messages)
-        audio_file = f"audio/{name}_custom_{emotion}.mp3"
-        return text, audio_file
 
 # Real-time face tracking variables
 tracked_faces = {}
@@ -1405,5 +1206,10 @@ while True:
         rotation_state = (rotation_state + 1) % 4
 
 running = False
+if tts_process is not None:
+    try:
+        tts_process.terminate()
+    except Exception:
+        pass
 cam.release()
 cv2.destroyAllWindows()
